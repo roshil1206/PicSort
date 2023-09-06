@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation for CSCI 5409 - Cloud Computing, created by Roshil Ka Patel.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: csci-5409-images
+
+Resources:
+  EC2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: ami-053b0d53c279acc90
+      InstanceType: t2.micro
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref EC2SecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          # Your custom script or commands go here
+          echo "Hello, this is the EC2 instance user data script!"
+          sudo apt update -y
+          sudo apt install git
+          sudo apt install -y curl
+          curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -
+          sudo apt install -y nodejs
+          sudo apt install npm -y
+          cd home/ubuntu
+          git clone https://rakpatel:glpat-2fAB_KUAcqD6n8anWaoD@git.cs.dal.ca/rakpatel/cloudterm.git 
+          echo "Clone completed"
+          cd cloudterm/backend
+          sudo npm install
+          echo "Nm installed"
+          sudo npm install pm2 -g
+          echo "Pm2 installed"
+          pm2 start index.js 
+          echo "Backend started"
+          pm2 save
+          cd ../frontend
+          sudo npm install
+          public_ip=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+          sudo REACT_APP_ENV=$public_ip npm run build
+          cd build
+          sudo iptables -t nat -I PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 3000
+          echo "Build completed"
+          sudo npm install -g serve
+          serve -s -l 3000
+          echo "Frontend running on 3000"
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group to enable ssh access and opened Http on 4000 and 80 port numbers
+      VpcId: vpc-076ca683c2a280a36
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          CidrIp: 0.0.0.0/0
+
+  DynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: myapplication
+      AttributeDefinitions:
+        - AttributeName: type
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: type
+          KeyType: HASH
+        - AttributeName: id
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 15
+        WriteCapacityUnits: 15
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt Lambda.Arn
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${Bucket}/*"
+      Bucket: !Ref Bucket
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: "true"
+        Origins:
+          - DomainName: !GetAtt Bucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: "redirect-to-https"
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: "false"
+            Cookies:
+              Forward: "none"
+      Tags:
+        - Key: name
+          Value: csci-5409-images
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ObjectDetectLambda
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Timeout: 30
+      Role: arn:aws:iam::377933443297:role/LabRole
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+
+          AWS.config.update({
+            region: "us-east-1",
+          });
+
+          const s3 = new AWS.S3();
+          const rekognition = new AWS.Rekognition();
+
+          const getIDFromKey = (key) => {
+            const regex = /\/([a-fA-F0-9-]+)\.[^.\/]+$/;
+            const match = key.match(regex);
+            return match[1];
+          };
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          const TableName = "myapplication";
+
+          const getImageById = async (id) => {
+            const params = {
+              TableName,
+              Key: {
+                type: "Image",
+                id,
+              },
+            };
+
+            return new Promise((resolve, reject) => {
+              dynamoDB.get(params, function (err, data) {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(data.Item);
+                }
+              });
+            });
+          };
+
+          const getUserById = async (id) => {
+            const params = {
+              TableName,
+              Key: {
+                type: "User",
+                id,
+              },
+            };
+
+            return new Promise((resolve, reject) => {
+              dynamoDB.get(params, function (err, data) {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(data.Item);
+                }
+              });
+            });
+          };
+
+          const updateImageEntryDB = async (key, tags, folder) => {
+            const params = {
+              TableName,
+              Key: {
+                type: "Image",
+                id: key,
+              },
+              UpdateExpression: "SET #tags = :newTags, #folder = :newFolder",
+              ExpressionAttributeNames: {
+                "#tags": "tags",
+                "#folder": "folder",
+              },
+              ExpressionAttributeValues: {
+                ":newTags": tags,
+                ":newFolder": folder,
+              },
+              ReturnValues: "ALL_NEW",
+            };
+
+            return new Promise((resolve, reject) => {
+              dynamoDB.update(params, (err, data) => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(data);
+                }
+              });
+            });
+          };
+
+          const appendTagToUser = async (id, tags) => {
+            const params = {
+              TableName,
+              Key: {
+                type: "User",
+                id: id,
+              },
+              UpdateExpression: "SET #tags = list_append(#tags, :newTags)",
+              ExpressionAttributeNames: {
+                "#tags": "tags",
+              },
+              ExpressionAttributeValues: {
+                ":newTags": tags,
+              },
+              ReturnValues: "ALL_NEW",
+            };
+
+            return new Promise((resolve, reject) => {
+              dynamoDB.update(params, (err, data) => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(data);
+                }
+              });
+            });
+          };
+
+          exports.handler = async (event, context) => {
+            try {
+              const S3Details = event.Records[0].s3;
+              const a = await s3
+                .getObject({
+                  Bucket: S3Details.bucket.name,
+                  Key: S3Details.object.key,
+                })
+                .promise();
+              const params = {
+                Image: {
+                  Bytes: a.Body,
+                },
+                MaxLabels: 5,
+                MinConfidence: 70,
+              };
+              const { Labels } = await rekognition.detectLabels(params).promise();
+
+              const Tags = Labels.map((label) => label.Name);
+              const selectedTag = Tags[0];
+
+              const id = getIDFromKey(S3Details.object.key);
+
+              const imageData = await getImageById(id);
+              const userDetails = await getUserById(imageData.userId);
+
+              const foundTag = userDetails.tags.filter((element) =>
+                Tags.includes(element)
+              )[0];
+
+              if (foundTag) {
+                await updateImageEntryDB(id, Tags, foundTag);
+              } else {
+                await updateImageEntryDB(id, Tags, selectedTag);
+              }
+
+              await updateImageEntryDB(id, Tags, selectedTag);
+
+              const isTagIncludedWithUser = userDetails.tags.includes(selectedTag);
+              if (!isTagIncludedWithUser) {
+                await appendTagToUser(imageData.userId, [selectedTag]);
+              }
+
+              return { userDetails };
+            } catch (err) {
+              console.log(err);
+              return { err };
+            }
+          };
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${BucketName}
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "application-error-alert"
+      DisplayName: "Application error Alert"
+
+  SNSEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: roshilkapatel2000@gmail.com
+      Protocol: email
+      TopicArn: !Ref SNSTopic

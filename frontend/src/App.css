@@ -1,0 +1,12 @@
+.App {
+  background-color: white;
+}
+
+.customHover {
+  cursor: pointer;
+}
+
+.customHover:hover {
+  box-shadow: 1px 8px 20px grey;
+  -webkit-transition: box-shadow 0.1s ease-in;
+}

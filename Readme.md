@@ -2,6 +2,8 @@
 
 It is an AWS-based, cloud-native image storage application designed to efficiently store user pictures while also offering automated picture sorting into organized directories.
 
+The application can be fully deployed using cloud formation script without any mannual configurations.
+
 ## Architecture
 
 ![](Architecture.png)
